@@ -11,11 +11,14 @@ Then open:      http://127.0.0.1:8000/docs   <- test everything here first, befo
 """
 
 from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import os
 import uuid
 import json
 from dotenv import load_dotenv
 from google import genai
+from PIL import Image, ImageEnhance
 
 # ---- SETUP ----------------------------------------------------------------
 
@@ -24,7 +27,21 @@ gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI(title="Artisan Backend")
 
+# Allows your Flutter app (running on a phone/emulator, a different "origin"
+# than this backend) to actually call these endpoints. Without this, browsers
+# and some HTTP clients block the request as a security measure.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # for the demo: allow any origin. Tighten later if needed.
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 os.makedirs("uploads", exist_ok=True)
+
+# Makes everything in uploads/ accessible via URL, e.g. /uploads/abc123_enhanced.jpg
+# This is how Flutter will actually display the enhanced image.
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # This is our "database" for the demo. Key = product_id, Value = all data about that product.
 # Example after upload: {"abc123": {"filename": "vase.jpg", "path": "uploads/vase.jpg"}}
@@ -104,7 +121,8 @@ def upload_photo(file: UploadFile):
         "filename": file.filename,
         "path": save_path,
         "listing": None,   # will be filled in by /generate-listing
-        "price": None
+        "price": None,
+        "enhanced_path": None   # will be filled in by /enhance-image
     }
 
     return {"product_id": product_id, "message": "Photo received"}
@@ -134,7 +152,42 @@ def generate_listing(product_id: str):
     return ai_result
 
 
-# ---- ENDPOINT 3: Fetch an already-generated listing ------------------------
+# ---- ENDPOINT 3: Enhance the product photo (Pillow, no AI call needed) -----
+
+@app.post("/enhance-image/{product_id}")
+def enhance_image(product_id: str):
+    """
+    Auto-enhances the uploaded photo: boosts brightness, contrast, color, and
+    sharpness so product photos look more professional. Uses Pillow, not AI —
+    fast, free, and doesn't depend on Gemini being up.
+    """
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    original_path = products[product_id]["path"]
+    image = Image.open(original_path).convert("RGB")
+
+    # Each of these nudges the image up a bit — tweak the numbers to taste.
+    # 1.0 = unchanged, >1.0 = more of that quality, <1.0 = less.
+    image = ImageEnhance.Brightness(image).enhance(1.1)
+    image = ImageEnhance.Contrast(image).enhance(1.15)
+    image = ImageEnhance.Color(image).enhance(1.2)       # more vivid colors
+    image = ImageEnhance.Sharpness(image).enhance(1.3)   # crisper edges
+
+    enhanced_filename = f"{product_id}_enhanced.jpg"
+    enhanced_path = f"uploads/{enhanced_filename}"
+    image.save(enhanced_path, "JPEG", quality=90)
+
+    products[product_id]["enhanced_path"] = enhanced_path
+
+    return {
+        "product_id": product_id,
+        "enhanced_image_url": f"/uploads/{enhanced_filename}",
+        "message": "Image enhanced"
+    }
+
+
+# ---- ENDPOINT 4: Fetch an already-generated listing ------------------------
 
 @app.get("/listing/{product_id}")
 def get_listing(product_id: str):
@@ -175,18 +228,49 @@ def get_pricing(product_id: str):
     return products[product_id]["price"]
 
 
-# ---- ENDPOINT 6: Business insights (mocked for demo) -----------------------
+# ---- ENDPOINT 6: Product insights (compares THIS product to the market) ----
 
-@app.get("/insights")
-def get_insights():
-    """Demand/growth insights. For the demo, mostly mocked — but a couple of stats are real (computed from our 'products' dict)."""
-    total_products = len(products)
-    return {
-        "total_listings_created": total_products,   # this one is real, computed live
-        "top_demand_category": "Home Decor / Pottery",
-        "growth_tip": "Products with blue pottery tags are trending 20% higher this month",
-        "recommended_focus": "Consider creating 2-3 more vase variations"
-    }
+@app.get("/product-insights/{product_id}")
+def get_product_insights(product_id: str, lang: str = "en"):
+    """
+    Compares this specific product's photo + listing to typical similar
+    handmade products sold online, and gives concrete areas to improve
+    (photography, presentation, description, pricing, uniqueness, etc.).
+    lang controls the output language directly, e.g. lang=hi for Hindi,
+    lang=ta for Tamil — same idea as /translate, just built in here.
+    """
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if products[product_id]["listing"] is None:
+        raise HTTPException(status_code=400, detail="Generate the listing first — call /generate-listing")
+
+    listing = products[product_id]["listing"]
+    image_path = products[product_id]["path"]
+
+    prompt = f"""Here is a handmade product listing:
+    Title: {listing.get('title')}
+    Description: {listing.get('description')}
+    Category: {listing.get('category')}
+    Price range: {listing.get('min_price')}-{listing.get('max_price')} {listing.get('price_currency')}
+
+    Looking at the product photo and this listing, compare it to typical
+    successful listings of similar handmade products sold online (e.g. on
+    Etsy, Amazon Handmade, or Indian marketplaces for regional crafts).
+    Identify 2-3 genuine strengths and 2-3 concrete areas where this specific
+    product or its listing could be improved (this could be about the
+    photography, presentation, description clarity, pricing, or the craft
+    itself). Be specific to what you actually see, not generic advice.
+
+    Write your entire response in the language with code '{lang}'."""
+
+    insight_shape = f"""{{
+        "strengths": ["...", "..."],
+        "areas_to_improve": ["...", "..."],
+        "language": "{lang}"
+    }}"""
+
+    ai_result = call_ai(prompt=prompt, image_path=image_path, json_shape=insight_shape)
+    return ai_result
 
 
 # ---- ENDPOINT 7: Voice query (text-based, Flutter does the speech-to-text) --

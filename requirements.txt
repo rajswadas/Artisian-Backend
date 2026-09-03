@@ -4,3 +4,4 @@ python-multipart
 requests
 google-genai
 python-dotenv
+Pillow
