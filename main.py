@@ -140,7 +140,7 @@ def enhance_image_ai(image_path: str, instruction: str) -> bytes:
     for attempt in range(max_attempts):
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash-image",
+                model="gemini-3.1-flash-image",
                 contents=[instruction, uploaded_file],
             )
             break
